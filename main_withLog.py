@@ -46,13 +46,14 @@ parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training')
 parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
 parser.add_argument('--resume', '-r', action='store_true',
                     help='resume from checkpoint')
-parser.add_argument('--zero_grad_mea', default=True, help='monitor the zero grad')
+parser.add_argument('--zero_grad_mea', default=True, type=bool, help='monitor the zero grad')
 parser.add_argument('--epochs', default=300, type=int, help='assigned running epochs')
+# parser.add_argument('--zero_grad_mea', default=False, type=bool, help='if the num_zero_error_grad fn will be activated')
 args = parser.parse_args()
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 best_acc = 0  # best test accuracy
-start_epoch = 0  # start from epoch 0 or last checkpoint epoch
+start_epoch = 1  # start from epoch 0 or last checkpoint epoch
 
 # Data
 print('==> Preparing data..')
@@ -98,7 +99,7 @@ print('==> Building model..')
 # net = EfficientNetB0()
 # net = RegNetX_200MF()
 # net = SimpleDLA()
-net = AlexNet()
+net = AlexNet(zero_grad_mea=args.zero_grad_mea)
 net = net.to(device)
 if device == 'cuda':
     # net = torch.nn.DataParallel(net)
@@ -179,6 +180,7 @@ def train(epoch):
 
 def test(epoch):
     global best_acc
+    global best_acc_epoch
     net.eval()
     test_loss = 0
     correct = 0
@@ -193,14 +195,14 @@ def test(epoch):
             _, predicted = outputs.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
-
+            acc = 100. * correct / total
             progress_bar(batch_idx, len(testloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
-                         % (test_loss / (batch_idx + 1), 100. * correct / total, correct, total))
+                         % (test_loss / (batch_idx + 1), acc, correct, total))
+
 
     # Save checkpoint.
-    acc = 100. * correct / total
     if acc > best_acc:
-        print('Saving..')
+        # print('Saving..')
         state = {
             'net': net.state_dict(),
             'acc': acc,
@@ -209,7 +211,10 @@ def test(epoch):
         if not os.path.isdir('checkpoint'):
             os.mkdir('checkpoint')
         torch.save(state, './checkpoint/ckpt.pth')
+        best_acc_epoch = epoch
         best_acc = acc
+    return acc, best_acc, best_acc_epoch
+
 
 
 def num_zero_error_grad(model):
@@ -232,7 +237,7 @@ def num_zero_error_grad(model):
             for layer in module:
                 # for layer in bblock:
                     if isinstance(layer, (GradConv2d, GradLinear)):
-                        print('yes')
+                        # print('yes')
                         flat_g = layer.error_grad.cpu().numpy().flatten()
                         zeros += np.sum(flat_g == 0)
                         total += len(flat_g)
@@ -251,9 +256,14 @@ for epoch in range(start_epoch, start_epoch + args.epochs):
     train(epoch)
     if args.zero_grad_mea:
         curr_zero_grads, num_grads, non_zero_indices = num_zero_error_grad(net)
-        logging.info("Number of zero_grads ({}/{})".format(curr_zero_grads, num_grads))
+        logging.info("[Epoch: {}] Number of zero_grads ({}/{})={:.2%}".format(epoch, curr_zero_grads, num_grads,
+                                                                  curr_zero_grads / num_grads))
         # print("Non zero indices is {}".format(non_zero_indices))
         grad_per = 100. * curr_zero_grads / num_grads
         zero_grads_percentage_list.append(np.around(grad_per, 2))
-    test(epoch)
+    accu, best_accu, best_accu_epoch = test(epoch)
+    logging.info("[Epoch: {}] Testing Accu: {}%".format(epoch, accu))
+    if epoch == args.epochs:
+        logging.info("[Epoch: {}] has the max accuracy of {:.2%}%".format(best_accu_epoch, best_accu))
+
     scheduler.step()
