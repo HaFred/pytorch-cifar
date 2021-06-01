@@ -39,6 +39,7 @@ import sys
 
 from models import *
 from utils import progress_bar
+from tqdm import tqdm
 # from torchsummary import summary
 # from ptflops import get_model_complexity_info
 
@@ -85,7 +86,6 @@ classes = ('plane', 'car', 'bird', 'cat', 'deer',
 # Model
 print('==> Building model..')
 # net = VGG('VGG19')
-# net = ResNet18()
 # net = PreActResNet18()
 # net = GoogLeNet()
 # net = DenseNet121()
@@ -99,8 +99,12 @@ print('==> Building model..')
 # net = EfficientNetB0()
 # net = RegNetX_200MF()
 # net = SimpleDLA()
-net = AlexNet(zero_grad_mea=args.zero_grad_mea)
+
+net = ResNet18(zero_grad_mea=args.zero_grad_mea)
+# net = AlexNet(zero_grad_mea=args.zero_grad_mea)
 net = net.to(device)
+# net_name = 'alexnet'
+net_name = 'resnet'
 if device == 'cuda':
     # net = torch.nn.DataParallel(net)
     net.cuda()
@@ -118,7 +122,10 @@ if args.resume:
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.SGD(net.parameters(), lr=args.lr,
                       momentum=0.9, weight_decay=5e-4)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
+
+# this one could also get 86.38% accuracy in 5_27_15_46_log
+# scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=70, gamma=0.1)
 
 # Logging
 if not os.path.exists('logging'):
@@ -129,7 +136,7 @@ time_str = str(localtime.tm_mon) + '_' + str(localtime.tm_mday) + '_' + str(loca
 logging.basicConfig(level=logging.DEBUG,
                     format='%(asctime)s %(name)s-%(levelname)s: %(message)s',
                     datefmt='%m-%d %H:%M:%S',
-                    filename='./logging/' + time_str + '_log.txt',
+                    filename='./logging/' + net_name + '_' + time_str + format(args.lr, '.0e') + '_log.txt',
                     filemode='w')
 # define a Handler which writes INFO messages or higher to the sys.stderr
 console = logging.StreamHandler(stream=sys.stdout)
@@ -161,7 +168,7 @@ def train(epoch):
     correct = 0
     total = 0
 
-    for batch_idx, (inputs, targets) in enumerate(trainloader):
+    for batch_idx, (inputs, targets) in enumerate(tqdm(trainloader, disable=True)):  # disable tqdm by true
         inputs, targets = inputs.to(device), targets.to(device)
         optimizer.zero_grad()
         outputs = net(inputs)
@@ -227,27 +234,66 @@ def num_zero_error_grad(model):
 
     zeros, total = 0, 0
     non_zero_indices_list = []
-    for module in model.children():
-        if isinstance(module, (GradConv2d, GradLinear)):  # comment this line to enable for noPrune
-            flat_g = module.error_grad.cpu().numpy().flatten()
-            zeros += np.sum(flat_g == 0)
-            total += len(flat_g)
-            non_zero_indices_list = np.where(flat_g != 0)
-        elif isinstance(module, nn.Sequential):
+    if isinstance(model, AlexNet):
+        for module in model.children():
+            if isinstance(module, (GradConv2d, GradLinear)):  # comment this line to enable for noPrune
+                flat_g = module.error_grad.cpu().numpy().flatten()
+                zeros += np.sum(flat_g == 0)
+                total += len(flat_g)
+                non_zero_indices_list = np.where(flat_g != 0)
+            elif isinstance(module, nn.Sequential):
+                for layer in module:
+                    # for layer in bblock:
+                        if isinstance(layer, (GradConv2d, GradLinear)):
+                            # print('yes')
+                            flat_g = layer.error_grad.cpu().numpy().flatten()
+                            zeros += np.sum(flat_g == 0)
+                            total += len(flat_g)
+                            non_zero_indices_list = np.where(flat_g != 0)
+            else:
+                raise ValueError('The modules involved are not registered for this fn, supports alexnet only')
+    elif isinstance(model, ResNet):
+        for module in model.children():
             for layer in module:
-                # for layer in bblock:
-                    if isinstance(layer, (GradConv2d, GradLinear)):
-                        # print('yes')
-                        flat_g = layer.error_grad.cpu().numpy().flatten()
-                        zeros += np.sum(flat_g == 0)
-                        total += len(flat_g)
-                        non_zero_indices_list = np.where(flat_g != 0)
-        else:
-            raise ValueError('The modules involved are not registered for this fn')
+                # for each layer
+                zero_grad, sum_g = 0, 0
+                if isinstance(layer, (GradConv2d, GradLinear)):  # for conv1 & fc6, comment this line to enable for noprune
+                    flat_g = layer.error_grad.cpu().numpy().flatten()
+                    zero_grad = np.sum(flat_g == 0)
+                    zeros += zero_grad
+                    sum_g = len(flat_g)
+                    total += sum_g
+                    # non_zero_idices = np.where(flat_g != 0)
 
-            # print('zero_grad: {}'.format(zeros))
-            # print('total: {}'.format(total))
-            # print('debug')
+                    # zero_grad of this layer write into df
+                    # layers_zero_grad_list.append(zero_grad / sum_g)
+                    # print('testing: this layer is {}, with the idx {}'.format(layer, idx_layer))
+                elif isinstance(layer, BasicBlock):
+                    flat_g = layer.conv1.error_grad.cpu().numpy().flatten() + layer.conv2.error_grad.cpu().numpy().flatten()
+                    zero_grad = np.sum(flat_g == 0)
+                    zeros += zero_grad
+                    sum_g = len(flat_g)
+                    total += sum_g
+                    # non_zero_idices = np.where(flat_g != 0)
+
+                    # zero_grad of this layer write into df
+                    # layers_zero_grad_list.append(zero_grad / sum_g)
+                    # print('testing: this layer is {}, with the idx {}'.format(layer, idx_layer))
+                    if layer.shortcut:  # check if the sequential object shortcut is not empty
+                        zero_grad, sum_g = 0, 0
+                        flat_g = layer.shortcut[0].error_grad.cpu().numpy().flatten()
+                        zero_grad = np.sum(flat_g == 0)
+                        zeros += zero_grad
+                        sum_g = len(flat_g)
+                        total += sum_g
+
+                        # zero_grad of this layer write into df
+                        # layers_zero_grad_list.append(zero_grad / sum_g)
+                        # # print('testing: this layer is {}, with the idx {}'.format(layer.shortcut, idx_layer))
+                        # idx_layer += 1
+    else:
+        raise ValueError('The error grad measurement supports resnet & alexnet for now')
+
     return int(zeros), int(total), non_zero_indices_list
 
 
@@ -264,6 +310,6 @@ for epoch in range(start_epoch, start_epoch + args.epochs):
     accu, best_accu, best_accu_epoch = test(epoch)
     logging.info("[Epoch: {}] Testing Accu: {}%".format(epoch, accu))
     if epoch == args.epochs:
-        logging.info("[Epoch: {}] has the max accuracy of {:.2%}%".format(best_accu_epoch, best_accu))
+        logging.info("[Epoch: {}] has the max accuracy of {}%".format(best_accu_epoch, best_accu))
 
     scheduler.step()
